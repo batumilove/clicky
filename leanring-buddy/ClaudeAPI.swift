@@ -8,13 +8,14 @@ import Foundation
 /// Claude API helper with streaming for progressive text display.
 class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
+    nonisolated(unsafe)
     private static var hasStartedTLSWarmup = false
 
     private let apiURL: URL
     var model: String
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "claude-sonnet-4-6") {
+    init(proxyURL: String, model: String = "gpt-5.5") {
         self.apiURL = URL(string: proxyURL)!
         self.model = model
 
