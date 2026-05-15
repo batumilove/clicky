@@ -187,7 +187,7 @@ function anthropicMessagesToResponsesInput(messages = []) {
 
 function buildResponsesPayload(anthropicBody) {
   return {
-    model: process.env.CODEX_MODEL || CODEX_MODEL,
+    model: anthropicBody.model || process.env.CODEX_MODEL || CODEX_MODEL,
     instructions: anthropicBody.system || 'You are Clicky, a concise screen-aware assistant.',
     input: anthropicMessagesToResponsesInput(anthropicBody.messages),
     stream: true,
