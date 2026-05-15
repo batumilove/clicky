@@ -6,23 +6,19 @@
 import Foundation
 
 /// Claude API helper with streaming for progressive text display.
-/// Supports model fallback: if the primary model fails (network error,
-/// non-2xx from proxy, etc.), subsequent models in `fallbackModels` are
-/// tried in order until one succeeds.
+/// Connects to the local Codex GPT-5.5 OAuth proxy at a configurable URL.
 class ClaudeAPI {
     private static let tlsWarmupLock = NSLock()
     nonisolated(unsafe)
     private static var hasStartedTLSWarmup = false
 
     private let apiURL: URL
-    private let fallbackModels: [String]
     private var currentModel: String
     private let session: URLSession
 
-    init(proxyURL: String, model: String = "gpt-5.5", fallbackModels: [String] = []) {
+    init(proxyURL: String, model: String = "gpt-5.5") {
         self.apiURL = URL(string: proxyURL)!
         self.currentModel = model
-        self.fallbackModels = fallbackModels
 
         // Use .default instead of .ephemeral so TLS session tickets are cached.
         // Ephemeral sessions do a full TLS handshake on every request, which causes
@@ -43,7 +39,7 @@ class ClaudeAPI {
     }
 
     /// Update the primary model at runtime (e.g. when the user selects a
-    /// different model from the panel).  Fallback models stay unchanged.
+    /// different model from the panel).
     func setModel(_ model: String) {
         currentModel = model
         print("📡 ClaudeAPI model set to: \(model)")
@@ -108,62 +104,16 @@ class ClaudeAPI {
         }.resume()
     }
 
-    /// Sends a vision request with model fallback.
-    /// If the current model fails (network error, non-2xx, timeout), the next
-    /// model from `fallbackModels` is tried.  All models are exhausted before
-    /// the error is propagated to the caller.
-    /// On each retry, `onFallbackModel(modelName:)` is called (if provided) so
-    /// the UI can reflect the switch.
+    /// Send a vision request to the Codex proxy with streaming.
+    /// The proxy translates the Anthropic-shaped body into a Codex Responses API call.
+    /// The `model` field is passed through to the proxy, which now respects it
+    /// (falling back to its own CODEX_MODEL env var if omitted).
     /// Calls `onTextChunk` on the main actor each time new text arrives.
     /// Returns the full accumulated text and total duration when the stream completes.
     func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
-        userPrompt: String,
-        onTextChunk: @MainActor @Sendable (String) -> Void,
-        onFallbackModel: @MainActor @Sendable (String) -> Void = { _ in }
-    ) async throws -> (text: String, duration: TimeInterval) {
-        let modelsToTry = [currentModel] + fallbackModels
-        var lastError: Error? = nil
-
-        for modelAttempt in modelsToTry {
-            if modelAttempt != currentModel {
-                print("🔄 ClaudeAPI falling back to model: \(modelAttempt)")
-                await onFallbackModel(modelAttempt)
-            }
-
-            do {
-                return try await performStreamingRequest(
-                    model: modelAttempt,
-                    images: images,
-                    systemPrompt: systemPrompt,
-                    conversationHistory: conversationHistory,
-                    userPrompt: userPrompt,
-                    onTextChunk: onTextChunk
-                )
-            } catch {
-                lastError = error
-                print("⚠️ ClaudeAPI model '\(modelAttempt)' failed: \(error.localizedDescription)")
-                // Continue to next fallback model
-                continue
-            }
-        }
-
-        // All models exhausted — throw the last error
-        throw lastError ?? NSError(
-            domain: "ClaudeAPI",
-            code: -1,
-            userInfo: [NSLocalizedDescriptionKey: "All models exhausted"]
-        )
-    }
-
-    /// Performs a single streaming request with the given model.
-    private func performStreamingRequest(
-        model: String,
-        images: [(data: Data, label: String)],
-        systemPrompt: String,
-        conversationHistory: [(userPlaceholder: String, assistantResponse: String)],
         userPrompt: String,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
@@ -202,7 +152,7 @@ class ClaudeAPI {
         messages.append(["role": "user", "content": contentBlocks])
 
         let body: [String: Any] = [
-            "model": model,
+            "model": currentModel,
             "max_tokens": 1024,
             "stream": true,
             "system": systemPrompt,
@@ -212,7 +162,7 @@ class ClaudeAPI {
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
         let payloadMB = Double(bodyData.count) / 1_048_576.0
-        print("🌐 Claude streaming request (\(model)): \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
+        print("🌐 Claude streaming request (\(currentModel)): \(String(format: "%.1f", payloadMB))MB, \(images.count) image(s)")
 
         // Use bytes streaming for SSE (Server-Sent Events)
         let (byteStream, response) = try await session.bytes(for: request)
@@ -273,17 +223,13 @@ class ClaudeAPI {
         return (text: accumulatedResponseText, duration: duration)
     }
 
-    /// Non-streaming fallback for validation requests.
-    /// Accepts a `model` parameter to use a specific model for this request,
-    /// defaulting to the current primary model.
+    /// Non-streaming fallback for validation requests where we don't need progressive display.
     func analyzeImage(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
-        userPrompt: String,
-        model: String? = nil
+        userPrompt: String
     ) async throws -> (text: String, duration: TimeInterval) {
-        let requestModel = model ?? currentModel
         let startTime = Date()
 
         var request = makeAPIRequest()
@@ -317,7 +263,7 @@ class ClaudeAPI {
         messages.append(["role": "user", "content": contentBlocks])
 
         let body: [String: Any] = [
-            "model": requestModel,
+            "model": currentModel,
             "max_tokens": 256,
             "system": systemPrompt,
             "messages": messages

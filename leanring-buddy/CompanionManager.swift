@@ -73,14 +73,69 @@ final class CompanionManager: ObservableObject {
     /// credentials instead of shipping an Anthropic key in the app or Worker.
     private static let workerBaseURL = "http://127.0.0.1:8877"
 
+    /// Primary GPT-5.5 client via the local Codex OAuth proxy.
     private lazy var claudeAPI: ClaudeAPI = {
-        let primaryModel = selectedModel
-        // Models to try in order if the primary is unavailable.  The local Codex
-        // proxy forwards these to the ChatGPT Codex Responses API — the available
-        // set depends on the user's ChatGPT plan.
-        let fallbacks = ["gpt-5.2", "gpt-4o", "gpt-4.1-nano"]
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: primaryModel, fallbackModels: fallbacks)
+        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
     }()
+
+    /// OpenAI-compatible fallback clients tried in order if GPT-5.5 via the
+    /// Codex proxy is unavailable. Each entry has a user-facing label and the
+    /// streaming API client configured with the provider's base URL + key.
+    /// Populated from UserDefaults so you can add/remove endpoints without
+    /// rebuilding — see setFallbackAPIKeys() for the storage format.
+    private lazy var fallbackAPIs: [(label: String, api: OpenAIChatAPI)] = {
+        return Self.loadFallbackAPIEndpoints()
+    }()
+
+    /// Loads fallback endpoint configs from UserDefaults (key: "fallbackAIEndpoints").
+    /// Expects a JSON array, each entry: { "label": str, "baseURL": str, "apiKey": str, "model": str }
+    /// Returns an empty array if nothing is configured or JSON is invalid.
+    private static func loadFallbackAPIEndpoints() -> [(label: String, api: OpenAIChatAPI)] {
+        guard let data = UserDefaults.standard.data(forKey: "fallbackAIEndpoints") else {
+            return []
+        }
+        guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
+            return []
+        }
+        return entries.compactMap { entry in
+            guard let label = entry["label"],
+                  let baseURL = entry["baseURL"],
+                  let model = entry["model"] else {
+                return nil
+            }
+            let apiKey = entry["apiKey"] ?? ""
+            print("📡 Loaded fallback '\(label)' → \(model) @ \(baseURL)\(apiKey.isEmpty ? " (no auth)" : "")")
+            return (label, OpenAIChatAPI(baseURL: baseURL, apiKey: apiKey, model: model))
+        }
+    }
+
+    /// Call this from anywhere (e.g. a debug terminal or shortcut) to configure
+    /// fallback endpoints at runtime without rebuilding the app:
+    ///
+    ///     let json = """
+    ///     [
+    ///       {"label": "OpenAI GPT-4o", "baseURL": "https://api.openai.com", "apiKey": "sk-...", "model": "gpt-4o"},
+    ///       {"label": "Local Ollama",  "baseURL": "http://localhost:11434",  "apiKey": "",            "model": "llama3.2-vision"}
+    ///     ]
+    ///     """
+    ///     CompanionManager.setFallbackAPIKeys(jsonString: json)
+    static func setFallbackAPIKeys(jsonString: String) {
+        guard let data = jsonString.data(using: .utf8),
+              let _ = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
+            print("⚠️ Invalid fallback API keys JSON — expected [{label, baseURL, apiKey, model}]")
+            return
+        }
+        UserDefaults.standard.set(data, forKey: "fallbackAIEndpoints")
+        UserDefaults.standard.synchronize()
+        print("📡 Fallback API endpoints saved (\(data.count) bytes)")
+    }
+
+    /// Clears all stored fallback endpoints.
+    static func clearFallbackAPIKeys() {
+        UserDefaults.standard.removeObject(forKey: "fallbackAIEndpoints")
+        UserDefaults.standard.synchronize()
+        print("📡 Fallback API endpoints cleared")
+    }
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
@@ -596,6 +651,62 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline
 
+    /// Tries the primary GPT-5.5 Codex proxy first, then each configured
+    /// OpenAI-compatible fallback endpoint.  Returns the response text and a
+    /// human-readable label identifying which provider handled the request.
+    private func performAIRequest(
+        images: [(data: Data, label: String)],
+        systemPrompt: String,
+        conversationHistory: [(userPlaceholder: String, assistantResponse: String)],
+        userPrompt: String
+    ) async throws -> (text: String, providerLabel: String) {
+        // Try primary: GPT-5.5 via Codex proxy
+        do {
+            print("🤖 AI request via primary (Codex GPT-5.5 proxy)")
+            let result = try await claudeAPI.analyzeImageStreaming(
+                images: images,
+                systemPrompt: systemPrompt,
+                conversationHistory: conversationHistory,
+                userPrompt: userPrompt,
+                onTextChunk: { _ in }
+            )
+            print("✅ AI response from primary (Codex GPT-5.5 proxy)")
+            return (result.text, "Codex GPT-5.5")
+        } catch {
+            guard !Task.isCancelled else { throw CancellationError() }
+            print("⚠️ Primary failed: \(error.localizedDescription)")
+        }
+
+        // Try each fallback in order
+        for (label, api) in fallbackAPIs {
+            guard !Task.isCancelled else { throw CancellationError() }
+            print("🔄 AI request via fallback: \(label)")
+            do {
+                let result = try await api.analyzeImageStreaming(
+                    images: images,
+                    systemPrompt: systemPrompt,
+                    conversationHistory: conversationHistory,
+                    userPrompt: userPrompt,
+                    onTextChunk: { _ in }
+                )
+                print("✅ AI response from fallback: \(label)")
+                return (result.text, label)
+            } catch {
+                guard !Task.isCancelled else { throw CancellationError() }
+                print("⚠️ Fallback '\(label)' failed: \(error.localizedDescription)")
+                continue
+            }
+        }
+
+        // All exhausted
+        throw NSError(
+            domain: "CompanionManager",
+            code: -1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "All AI providers exhausted. Check that your API keys are valid."]
+        )
+    }
+
     /// Captures a screenshot, sends it along with the transcript to GPT-5.5,
     /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
@@ -628,17 +739,12 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                // Try primary (GPT-5.5 via Codex proxy) then fallback endpoints
+                let (fullResponseText, providerLabel) = try await self.performAIRequest(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    },
-                    onFallbackModel: { model in
-                        print("⬇️ Clicky fell back to model: \(model)")
-                    }
+                    userPrompt: transcript
                 )
 
                 guard !Task.isCancelled else { return }
@@ -714,7 +820,7 @@ final class CompanionManager: ObservableObject {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
 
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+                print("🧠 Conversation history: \(conversationHistory.count) exchanges (provider: \(providerLabel))")
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
@@ -1007,10 +1113,7 @@ final class CompanionManager: ObservableObject {
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
                     userPrompt: "look around my screen and find something interesting to point at",
-                    onTextChunk: { _ in },
-                    onFallbackModel: { model in
-                        print("⬇️ Onboarding demo fell back to model: \(model)")
-                    }
+                    onTextChunk: { _ in }
                 )
 
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
