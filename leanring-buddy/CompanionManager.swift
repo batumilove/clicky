@@ -74,7 +74,12 @@ final class CompanionManager: ObservableObject {
     private static let workerBaseURL = "http://127.0.0.1:8877"
 
     private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
+        let primaryModel = selectedModel
+        // Models to try in order if the primary is unavailable.  The local Codex
+        // proxy forwards these to the ChatGPT Codex Responses API — the available
+        // set depends on the user's ChatGPT plan.
+        let fallbacks = ["gpt-5.2", "gpt-4o", "gpt-4.1-nano"]
+        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: primaryModel, fallbackModels: fallbacks)
     }()
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
@@ -114,7 +119,7 @@ final class CompanionManager: ObservableObject {
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedGPTModel")
-        claudeAPI.model = model
+        claudeAPI.setModel(model)
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -630,6 +635,9 @@ final class CompanionManager: ObservableObject {
                     userPrompt: transcript,
                     onTextChunk: { _ in
                         // No streaming text display — spinner stays until TTS plays
+                    },
+                    onFallbackModel: { model in
+                        print("⬇️ Clicky fell back to model: \(model)")
                     }
                 )
 
@@ -999,7 +1007,10 @@ final class CompanionManager: ObservableObject {
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
                     userPrompt: "look around my screen and find something interesting to point at",
-                    onTextChunk: { _ in }
+                    onTextChunk: { _ in },
+                    onFallbackModel: { model in
+                        print("⬇️ Onboarding demo fell back to model: \(model)")
+                    }
                 )
 
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
