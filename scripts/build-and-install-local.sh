@@ -4,66 +4,55 @@ umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="${CLICKY_APP_PATH:-$HOME/Applications/Clicky.app}"
+case "$APP" in
+  /*) ;;
+  *)
+    printf 'Clicky bundle destination must be absolute: %s\n' "$APP" >&2
+    exit 2
+    ;;
+esac
 APP_PARENT="$(dirname "$APP")"
 SWIFT_BIN="${SWIFT_BIN:-$HOME/.swiftly/bin/swift}"
 if [[ ! -x "$SWIFT_BIN" ]]; then
   SWIFT_BIN="$(command -v swift)"
 fi
 
-mkdir -p "$APP_PARENT"
+if [[ ! -d "$APP_PARENT" ]]; then
+  printf 'Clicky bundle parent must already exist: %s\n' "$APP_PARENT" >&2
+  exit 2
+fi
+cd "$ROOT"
+/usr/bin/python3 -c 'import sys; from pathlib import Path; from scripts.atomic_replace_app import _validate_path; _validate_path(Path(sys.argv[1]), must_exist=False)' "$APP"
+
 STAGE_ROOT="$(mktemp -d "$APP_PARENT/.Clicky.install.XXXXXX")"
 chmod 700 "$STAGE_ROOT"
 STAGED_APP="$STAGE_ROOT/Clicky.app"
-BACKUP_APP="$STAGE_ROOT/Clicky.previous.app"
-SWAPPED=0
-NEW_INSTALLED=0
-
-atomic_swap() {
-  /usr/bin/python3 - "$1" "$2" <<'PY'
-import ctypes
-import os
-import sys
-
-AT_FDCWD = -2
-RENAME_SWAP = 0x00000002
-left, right = map(os.fsencode, sys.argv[1:3])
-libc = ctypes.CDLL(None, use_errno=True)
-renameatx_np = libc.renameatx_np
-renameatx_np.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-renameatx_np.restype = ctypes.c_int
-if renameatx_np(AT_FDCWD, left, AT_FDCWD, right, RENAME_SWAP) != 0:
-    err = ctypes.get_errno()
-    raise OSError(err, os.strerror(err))
-PY
-}
+KEEP_STAGE=0
+REPLACEMENT_STARTED=0
+COMMITTED=0
 
 cleanup() {
-  rm -rf "$STAGE_ROOT"
+  if [[ "$KEEP_STAGE" -eq 1 ]]; then
+    printf 'Preserved Clicky rollback evidence at %s\n' "$STAGE_ROOT" >&2
+  else
+    rm -rf "$STAGE_ROOT"
+  fi
 }
 
-rollback() {
+preserve_on_failure() {
   status="$1"
   trap - ERR INT TERM
-  set +e
-  if [[ "$SWAPPED" -eq 1 ]]; then
-    if [[ -e "$BACKUP_APP" ]]; then
-      atomic_swap "$BACKUP_APP" "$APP"
-      rm -rf "$BACKUP_APP"
-    elif [[ -e "$STAGED_APP" ]]; then
-      atomic_swap "$STAGED_APP" "$APP"
-    fi
-  elif [[ "$NEW_INSTALLED" -eq 1 ]]; then
-    rm -rf "$APP"
+  if [[ "$REPLACEMENT_STARTED" -eq 1 && "$COMMITTED" -eq 0 ]]; then
+    KEEP_STAGE=1
   fi
   exit "$status"
 }
 
 trap cleanup EXIT
-trap 'rollback $?' ERR
-trap 'rollback 130' INT
-trap 'rollback 143' TERM
+trap 'preserve_on_failure $?' ERR
+trap 'preserve_on_failure 130' INT
+trap 'preserve_on_failure 143' TERM
 
-cd "$ROOT"
 "$SWIFT_BIN" build -c release --product Clicky --disable-sandbox
 
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources" "$STAGED_APP/Contents/Frameworks"
@@ -93,20 +82,15 @@ codesign --force --deep --sign - "$STAGED_APP"
 codesign --verify --deep --strict --verbose=2 "$STAGED_APP" >/dev/null
 [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$STAGED_APP/Contents/Info.plist")" == "so.clicky.gpt55.local" ]]
 
-if [[ -e "$APP" ]]; then
-  atomic_swap "$STAGED_APP" "$APP"
-  SWAPPED=1
-  mv "$STAGED_APP" "$BACKUP_APP"
-else
-  mv "$STAGED_APP" "$APP"
-  NEW_INSTALLED=1
+REPLACEMENT_STARTED=1
+set +e
+/usr/bin/python3 "$ROOT/scripts/atomic_replace_app.py" "$STAGED_APP" "$APP"
+replace_status=$?
+set -e
+if [[ "$replace_status" -ne 0 ]]; then
+  KEEP_STAGE=1
+  exit "$replace_status"
 fi
-
-codesign --verify --deep --strict --verbose=2 "$APP" >/dev/null
-[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" == "so.clicky.gpt55.local" ]]
-
-rm -rf "$BACKUP_APP"
-SWAPPED=0
-NEW_INSTALLED=0
+COMMITTED=1
 trap - ERR INT TERM
 printf 'Installed %s\n' "$APP"

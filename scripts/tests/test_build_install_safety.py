@@ -14,24 +14,24 @@ class AtomicInstallContractTests(unittest.TestCase):
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$STAGED_APP"', text)
         self.assertLess(
             text.index('codesign --verify --deep --strict --verbose=2 "$STAGED_APP"'),
-            text.index('mv "$STAGED_APP" "$APP"'),
+            text.index('scripts/atomic_replace_app.py" "$STAGED_APP" "$APP"'),
         )
 
-    def test_replacement_preserves_and_restores_previous_bundle_on_failure(self) -> None:
+    def test_replacement_delegates_to_transaction_helper_and_preserves_failures(self) -> None:
         text = SCRIPT.read_text()
-        self.assertIn('BACKUP_APP="$STAGE_ROOT/Clicky.previous.app"', text)
-        self.assertIn('atomic_swap "$STAGED_APP" "$APP"', text)
-        self.assertIn('mv "$STAGED_APP" "$BACKUP_APP"', text)
-        self.assertIn('atomic_swap "$BACKUP_APP" "$APP"', text)
-        self.assertIn("trap 'rollback $?' ERR", text)
-        self.assertIn("trap 'rollback 130' INT", text)
-        self.assertIn("trap 'rollback 143' TERM", text)
+        self.assertIn('REPLACEMENT_STARTED=1', text)
+        self.assertIn('scripts/atomic_replace_app.py" "$STAGED_APP" "$APP"', text)
+        self.assertIn('KEEP_STAGE=1', text)
+        self.assertIn('trap \'preserve_on_failure $?\' ERR', text)
+        self.assertIn("trap 'preserve_on_failure 130' INT", text)
+        self.assertIn("trap 'preserve_on_failure 143' TERM", text)
         self.assertIn("trap - ERR INT TERM", text)
 
-    def test_staging_and_backup_are_private_siblings_of_destination(self) -> None:
+    def test_staging_is_a_private_sibling_of_absolute_destination(self) -> None:
         text = SCRIPT.read_text()
         self.assertIn("umask 077", text)
         self.assertIn('APP_PARENT="$(dirname "$APP")"', text)
+        self.assertIn('bundle destination must be absolute', text)
         self.assertIn('STAGE_ROOT="$(mktemp -d "$APP_PARENT/.Clicky.install.XXXXXX")"', text)
         self.assertIn('chmod 700 "$STAGE_ROOT"', text)
 
