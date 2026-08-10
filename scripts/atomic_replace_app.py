@@ -149,42 +149,76 @@ def replace_app(
                 os.rename(staged, destination)
                 installed_fresh = True
             _fsync_directories(staged, destination)
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+            restore_mask = mask
             mask = None
+            signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
 
             verify(destination)
         except BaseException as original:
             if mask is None:
                 mask = signal.pthread_sigmask(signal.SIG_BLOCK, _SIGNAL_SET)
             rollback_failure: Optional[RollbackFailed] = None
+            rollback_restored = False
             try:
                 if swapped:
-                    atomic_swap(staged, destination)
+                    try:
+                        atomic_swap(staged, destination)
+                        rollback_restored = True
+                    except BaseException as rollback_error:
+                        rollback_failure = RollbackFailed(
+                            "rollback swap failed; previous bundle is preserved at "
+                            f"{staged} and replacement remains at {destination}: {rollback_error}"
+                        )
                 elif installed_fresh and os.path.lexists(destination):
-                    os.rename(destination, staged)
-                _fsync_directories(staged, destination)
-            except BaseException as rollback_error:
-                rollback_failure = RollbackFailed(
-                    "rollback failed; preserved prior bundle remains at "
-                    f"{staged}: {rollback_error}"
-                )
+                    try:
+                        os.rename(destination, staged)
+                        rollback_restored = True
+                    except BaseException as rollback_error:
+                        rollback_failure = RollbackFailed(
+                            "fresh-install rollback failed; replacement may remain at "
+                            f"{destination}: {rollback_error}"
+                        )
+
+                if rollback_failure is None:
+                    try:
+                        _fsync_directories(staged, destination)
+                    except BaseException as durability_error:
+                        if swapped and rollback_restored:
+                            rollback_failure = RollbackFailed(
+                                "previous bundle was restored at destination and replacement "
+                                f"preserved at {staged}, but rollback durability sync failed: "
+                                f"{durability_error}"
+                            )
+                        elif installed_fresh and rollback_restored:
+                            rollback_failure = RollbackFailed(
+                                "fresh-install replacement was moved back to staging, but "
+                                f"rollback durability sync failed: {durability_error}"
+                            )
+                        else:
+                            rollback_failure = RollbackFailed(
+                                f"rollback durability sync failed: {durability_error}"
+                            )
             finally:
                 if mask is not None:
+                    restore_mask = mask
+                    mask = None
                     try:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                        signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
                     except ReplaceInterrupted:
                         if rollback_failure is None:
                             raise
-                    finally:
-                        mask = None
             if rollback_failure is not None:
                 raise rollback_failure from original
             raise
     finally:
-        if mask is not None:
-            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
+        try:
+            if mask is not None:
+                restore_mask = mask
+                mask = None
+                signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
+        finally:
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
 
 
 def main() -> int:
