@@ -149,9 +149,9 @@ def replace_app(
                 os.rename(staged, destination)
                 installed_fresh = True
             _fsync_directories(staged, destination)
-            restore_mask = mask
+            initial_restore_mask = mask
             mask = None
-            signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
+            signal.pthread_sigmask(signal.SIG_SETMASK, initial_restore_mask)
 
             verify(destination)
         except BaseException as original:
@@ -200,10 +200,10 @@ def replace_app(
                             )
             finally:
                 if mask is not None:
-                    restore_mask = mask
+                    rollback_restore_mask = mask
                     mask = None
                     try:
-                        signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
+                        signal.pthread_sigmask(signal.SIG_SETMASK, rollback_restore_mask)
                     except ReplaceInterrupted:
                         if rollback_failure is None:
                             raise
@@ -213,9 +213,9 @@ def replace_app(
     finally:
         try:
             if mask is not None:
-                restore_mask = mask
+                final_restore_mask = mask
                 mask = None
-                signal.pthread_sigmask(signal.SIG_SETMASK, restore_mask)
+                signal.pthread_sigmask(signal.SIG_SETMASK, final_restore_mask)
         finally:
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
